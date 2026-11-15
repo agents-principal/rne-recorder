@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>답변 녹음 · R&amp;E 리허설 코치</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#f3f6f5;--surface:#fff;--ink:#17211e;--muted:#5a6a65;--line:#d6dfdb;--accent:#1f6f5c;--accent-ink:#fff;--bad:#b4372f;--rec:#c0392b}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1513;--surface:#161e1b;--ink:#e3ebe8;--muted:#97a8a2;--line:#2a3531;--accent:#4fb39a;--accent-ink:#0f1513;--bad:#ef8a80;--rec:#ef6f61}}
+:root[data-theme="dark"]{--bg:#0f1513;--surface:#161e1b;--ink:#e3ebe8;--muted:#97a8a2;--line:#2a3531;--accent:#4fb39a;--accent-ink:#0f1513;--bad:#ef8a80;--rec:#ef6f61}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,"Noto Sans KR","Apple SD Gothic Neo",sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+main{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:24px 20px;width:100%;max-width:420px;text-align:center}
+h1{font-size:1.3rem;margin:0 0 6px}
+#status{margin:0 0 16px;color:var(--muted);min-height:3.2em}
+#status.err{color:var(--bad)}
+.dot{width:96px;height:96px;border-radius:50%;margin:0 auto 16px;background:var(--line);transition:transform .08s,background .2s}
+.dot.on{background:var(--rec)}
+button{font:inherit;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);padding:12px 16px;min-height:48px;width:100%;margin-top:10px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+.note{font-size:.82rem;color:var(--muted);margin:14px 0 0}
+@media (prefers-reduced-motion:reduce){.dot{transition:none}}
+</style>
+</head>
+<body>
+<main>
+  <h1>답변 녹음</h1>
+  <p id="status" aria-live="polite">마이크를 준비하는 중입니다…</p>
+  <div class="dot" id="dot" aria-hidden="true"></div>
+  <button class="primary" id="btnDone" type="button" disabled>말하기 끝 · 보내기</button>
+  <button id="btnCancel" type="button">취소</button>
+  <p class="note">R&amp;E 리허설 코치의 녹음 창입니다. 녹음은 이 창이나 이 사이트에 저장되지 않습니다. 리허설 코치로 보낸 뒤 바로 지워지고, 학교 서버를 거쳐 ElevenLabs에서 글자로 바뀝니다.</p>
+</main>
+<script>
+// Recorder window for the R&E rehearsal coach (Apps Script web app).
+// The web app runs inside Google's iframe, which has no microphone permission, so it opens this
+// top-level page. This page records, sends the audio back to window.opener with postMessage and
+// closes. It talks to no server and stores nothing.
+// Hash parameters: s = seconds of silence that end the recording (0 = only the button).
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var params = new URLSearchParams(location.hash.slice(1));
+  var silenceSec = Math.min(10, Math.max(0, Number(params.get("s")) || 0));
+  var MAX_SEC = 180;
+  var opener = window.opener;
+  var rec = null, stream = null, chunks = [], ctx = null, timer = null, sent = false;
+  var heard = false, lastLoud = 0, startedAt = 0;
+
+  function status(msg, err) { var s = $("status"); s.textContent = msg; s.className = err ? "err" : ""; }
+  function post(msg, transfer) { try { opener.postMessage(msg, "*", transfer || []); } catch (e) { /* opener gone */ } }
+  function cleanup() {
+    clearInterval(timer);
+    try { if (stream) stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { if (ctx) ctx.close(); } catch (e) {}
+    chunks = []; stream = null; ctx = null;
+  }
+  function closeSoon() { setTimeout(function () { window.close(); }, 400); }
+
+  if (!opener) {
+    status("이 페이지는 R&E 리허설 코치의 [🎙 녹음하기] 버튼으로 열어야 합니다.", true);
+    $("btnCancel").hidden = true;
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === "undefined") {
+    status("이 브라우저는 녹음을 지원하지 않습니다. Chrome에서 열어 주세요.", true);
+    post({ type: "rc-error", error: "unsupported" });
+    return;
+  }
+
+  function pickMime() {
+    var list = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+    for (var i = 0; i < list.length; i++) if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(list[i])) return list[i];
+    return "";
+  }
+
+  function finish() {
+    if (!rec || rec.state === "inactive") return;
+    $("btnDone").disabled = true;
+    status("보내는 중입니다…");
+    rec.stop();
+  }
+
+  navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+    .then(function (s) {
+      stream = s;
+      var mime = pickMime();
+      rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.onstop = function () {
+        var type = rec.mimeType || mime || "audio/webm";
+        var blob = new Blob(chunks, { type: type });
+        cleanup();
+        blob.arrayBuffer().then(function (buf) {
+          sent = true;
+          post({ type: "rc-audio", v: 1, mime: type, buf: buf }, [buf]);
+          status("보냈습니다. 이 창은 곧 닫힙니다. 닫히지 않으면 직접 닫아 주세요.");
+          closeSoon();
+        });
+      };
+      rec.start(250);
+      startedAt = Date.now();
+      $("btnDone").disabled = false;
+      status(silenceSec ? "말해 주세요. 말이 " + silenceSec + "초 멈추면 자동으로 보냅니다." : "말해 주세요. 다 말했으면 [말하기 끝]을 누르세요.");
+      post({ type: "rc-ready", v: 1 });
+
+      // 소리 크기로 말하는 중인지 판단 → 말이 멈추면 자동 종료
+      try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        ctx = new AC();
+        var src = ctx.createMediaStreamSource(stream);
+        var an = ctx.createAnalyser(); an.fftSize = 1024; src.connect(an);
+        var data = new Uint8Array(an.fftSize);
+        timer = setInterval(function () {
+          an.getByteTimeDomainData(data);
+          var sum = 0; for (var i = 0; i !== data.length; i++) { var v = (data[i] - 128) / 128; sum += v * v; }
+          var rms = Math.sqrt(sum / data.length);
+          var now = Date.now();
+          $("dot").className = "dot" + (rms > 0.02 ? " on" : "");
+          $("dot").style.transform = "scale(" + (1 + Math.min(rms * 6, 0.35)) + ")";
+          if (rms > 0.02) { heard = true; lastLoud = now; }
+          if (silenceSec && heard && now - lastLoud > silenceSec * 1000) finish();
+          if (now - startedAt > MAX_SEC * 1000) finish();
+        }, 100);
+      } catch (e) { /* 소리 크기 측정이 안 되면 버튼으로만 끝냄 */ }
+    })
+    .catch(function (e) {
+      status("마이크를 쓸 수 없습니다. 주소창 왼쪽 아이콘 → 권한 → 마이크를 허용한 뒤 리허설 코치에서 다시 [🎙 녹음하기]를 눌러 주세요.", true);
+      post({ type: "rc-error", error: (e && e.name) || "error" });
+    });
+
+  $("btnDone").addEventListener("click", finish);
+  $("btnCancel").addEventListener("click", function () {
+    sent = true;
+    try { if (rec && rec.state !== "inactive") { rec.onstop = null; rec.stop(); } } catch (e) {}
+    cleanup();
+    post({ type: "rc-cancel" });
+    window.close();
+  });
+  window.addEventListener("pagehide", function () {
+    if (!sent) { try { if (rec && rec.state !== "inactive") { rec.onstop = null; rec.stop(); } } catch (e) {} cleanup(); post({ type: "rc-cancel" }); }
+  });
+})();
+</script>
+</body>
+</html>
